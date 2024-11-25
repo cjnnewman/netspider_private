@@ -140,9 +140,6 @@ class EscortalligatorScraper(ScraperPrototype):
             print(f"Error initializing driver: {e}")
             raise
 
-        if hasattr(self, '_stop_event') and self._stop_event.is_set():
-            return
-
         # Open Webpage with URL
         self.open_webpage()
         # Find links of posts
@@ -157,9 +154,6 @@ class EscortalligatorScraper(ScraperPrototype):
         self.pdf_filename = f'{self.screenshot_directory}/escortalligator-{self.city}-{self.date_time}.pdf'
         os.mkdir(self.screenshot_directory)
 
-        if hasattr(self, '_stop_event') and self._stop_event.is_set():
-            return
-
         # Get data from posts
         self.get_data(links)
         self.close_webpage()
@@ -172,13 +166,9 @@ class EscortalligatorScraper(ScraperPrototype):
         try:
             if self.driver:
                 print("Attempting to quit WebDriver in stop_scraper...")
-                try:
-                    self.driver.quit()
-                except Exception as e:
-                    print(f"Error quitting driver: {e}")
-                finally:
-                    self.driver = None
-                    print("Driver quit successfully in stop_scraper.")
+                self.driver.quit()
+                self.driver = None
+                print("Driver quit successfully in stop_scraper.")
             else:
                 print("Driver is already None in stop_scraper.")
         except Exception as e:

@@ -59,7 +59,7 @@ class ScraperManager:
         self.scraper_thread = None
         self._lock = threading.Lock()
         self._active_threads = set()
-        self._cleanup_timeout = 10  # seconds
+        self._cleanup_timeout = 10
 
     def start_scraper(self, kwargs):
         with self._lock:
@@ -87,11 +87,8 @@ class ScraperManager:
                 finally:
                     if self.scraper_thread in self._active_threads:
                         self._active_threads.remove(self.scraper_thread)
+                    self.scraper_thread = None
                     self.cleanup_dead_threads()
-                    remaining_threads = [t for t in threading.enumerate() if t != threading.main_thread()]
-                    print(f"Active threads: {len(self._active_threads)}")
-                    print(f"System threads: {len(remaining_threads)}")
-                    print("Thread names:", [t.name for t in remaining_threads])
 
     def force_stop_thread(self, max_attempts=3):
         if self.scraper_thread:
@@ -166,19 +163,45 @@ class ScraperManager:
                     print(f"Error force terminating thread: {e}")
 
     def cleanup_dead_threads(self):
+        # Get dead threads from active_threads set
         dead_threads = {thread for thread in self._active_threads if not thread.is_alive()}
+        
+        # Force cleanup all dead threads
         for thread in dead_threads:
-            print(f"Cleaning up thread {thread.ident}")
             try:
-                thread.cleanup_resources()
-                thread.join(timeout=1)
+                if not getattr(thread, '_terminated', False):
+                    print(f"Force terminating dead thread {thread.name}")
+                    thread._force_terminate()
                 self._active_threads.remove(thread)
             except Exception as e:
-                print(f"Error cleaning thread {thread.ident}: {e}")
-            finally:
-                # Ensure thread is removed even if cleanup fails
+                print(f"Error cleaning dead thread {thread.name}: {e}")
                 if thread in self._active_threads:
                     self._active_threads.remove(thread)
+        
+        # Find and force cleanup any lingering scraper threads
+        all_threads = threading.enumerate()
+        scraper_threads = [t for t in all_threads 
+                         if t.name.startswith('Scraper-') 
+                         and t != threading.current_thread()]
+        
+        for thread in scraper_threads:
+            try:
+                if not getattr(thread, '_terminated', False):
+                    print(f"Force terminating lingering thread {thread.name}")
+                    if hasattr(thread, '_force_terminate'):
+                        thread._force_terminate()
+            except Exception as e:
+                print(f"Error terminating lingering thread {thread.name}: {e}")
+
+        # Print final thread status
+        remaining_threads = [t for t in threading.enumerate() 
+                           if t != threading.main_thread() 
+                           and not t.name.startswith('Dummy-')
+                           and not getattr(t, '_terminated', False)]
+        
+        print(f"Active threads: {len(self._active_threads)}")
+        print(f"System threads: {len(remaining_threads)}")
+        print(f"Thread names: {[t.name for t in remaining_threads]}")
 
 
 class ScraperThread(threading.Thread):
@@ -190,7 +213,8 @@ class ScraperThread(threading.Thread):
         self._cleanup_lock = threading.Lock()
         self._cleanup_complete = False
         self._cleanup_attempted = False
-        self.name = f"Scraper-{threading.current_thread().ident}"  # Give meaningful name
+        self._terminated = False
+        self.name = f"Scraper-{threading.current_thread().ident}"
 
     def _init_scraper(self, kwargs):
         keywords = set(kwargs['keywords'].split(','))
@@ -270,13 +294,27 @@ class ScraperThread(threading.Thread):
         finally:
             self._stop_event.set()
 
-    def join_with_timeout(self, timeout=5):
+    def join_with_timeout(self, timeout=10):
+        """Enhanced join with force termination"""
         self._stop_event.set()
         start = time.time()
         while self.is_alive() and time.time() - start < timeout:
             time.sleep(0.1)
         if self.is_alive():
-            print(f"Thread {self.ident} failed to join within timeout")
+            print(f"Thread {self.ident} failed to join within timeout - forcing termination")
+            self._force_terminate()
+
+    def _force_terminate(self):
+        """Force terminate this thread"""
+        if not self._terminated:
+            if sys.platform == 'win32':
+                try:
+                    import ctypes
+                    ctypes.windll.kernel32.TerminateThread(
+                        ctypes.c_void_p(self.ident), 0)
+                    self._terminated = True
+                except Exception as e:
+                    print(f"Error force terminating thread: {e}")
 
     def stopped(self):
         return self._stop_event.is_set()
