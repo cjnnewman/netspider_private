@@ -5,6 +5,7 @@ import json
 gevent.monkey.patch_all()
 
 import threading
+import traceback
 import time  # Add this import
 import socket
 import psutil
@@ -84,10 +85,13 @@ class ScraperManager:
                     if self.scraper_thread.is_alive():
                         self.force_stop_thread()
                 finally:
+                    if self.scraper_thread in self._active_threads:
+                        self._active_threads.remove(self.scraper_thread)
                     self.cleanup_dead_threads()
-                    print("thread count after stop: ", len(self._active_threads))
-                return {"Response": "Scraper Thread Stopped"}
-            return {"Response": "No active Scraper Thread"}
+                    remaining_threads = [t for t in threading.enumerate() if t != threading.main_thread()]
+                    print(f"Active threads: {len(self._active_threads)}")
+                    print(f"System threads: {len(remaining_threads)}")
+                    print("Thread names:", [t.name for t in remaining_threads])
 
     def force_stop_thread(self, max_attempts=3):
         if self.scraper_thread:
@@ -104,18 +108,38 @@ class ScraperManager:
                         break
                 except Exception as e:
                     print(f"Force stop attempt {attempt + 1} failed: {e}")
+            
+            # Remove thread from active_threads before setting to None
+            if self.scraper_thread in self._active_threads:
+                self._active_threads.remove(self.scraper_thread)
             self.scraper_thread = None
 
     def _graceful_shutdown(self):
-        """Attempt graceful shutdown first"""
         try:
-            if hasattr(self.scraper_thread.scraper, 'driver'):
-                self.scraper_thread.scraper.driver.quit()
+            if hasattr(self.scraper_thread.scraper, 'driver') and self.scraper_thread.scraper.driver is not None:
+                print("Trying to quit driver ...")
+                try:
+                    self.scraper_thread.scraper.driver.quit()
+                    self.scraper_thread.scraper.driver = None
+                    print("Driver quit successfully in _graceful_shutdown.")
+                except Exception as e:
+                    print(f"Error quitting driver in _graceful_shutdown: {e}")
+            else:
+                print("Driver is already None in _graceful_shutdown.")
+
+            # Call stop_scraper for additional cleanup
             self.scraper_thread.scraper.stop_scraper()
+            print("stop_scraper executed successfully.")
+
+            # Signal and wait for thread termination
             self.scraper_thread._stop_event.set()
+            print("Stop event set.")
             self.scraper_thread.join(timeout=2)
+            print("Thread joined successfully.")
         except Exception as e:
             print(f"Graceful shutdown failed: {e}")
+            with open("shutdown_traceback.log", "a") as log_file:
+                traceback.print_exc(file=log_file)  # Logs the traceback to a file
 
     def _kill_browser_processes(self):
         """Kill any remaining browser processes"""
@@ -143,37 +167,35 @@ class ScraperManager:
 
     def cleanup_dead_threads(self):
         dead_threads = {thread for thread in self._active_threads if not thread.is_alive()}
-        cleaned = 0
         for thread in dead_threads:
+            print(f"Cleaning up thread {thread.ident}")
             try:
-                if hasattr(thread, 'cleanup_resources'):
-                    thread.cleanup_resources()
+                thread.cleanup_resources()
                 thread.join(timeout=1)
-                cleaned += 1
-                print(f"Cleaned up thread {thread.ident}")
+                self._active_threads.remove(thread)
             except Exception as e:
                 print(f"Error cleaning thread {thread.ident}: {e}")
-        self._active_threads -= dead_threads
-        print(f"Cleaned up {cleaned} dead threads")
+            finally:
+                # Ensure thread is removed even if cleanup fails
+                if thread in self._active_threads:
+                    self._active_threads.remove(thread)
 
 
 class ScraperThread(threading.Thread):
     def __init__(self, kwargs):
-        super(ScraperThread, self).__init__()
+        super().__init__(daemon=True)
         self._stop_event = threading.Event()
         self.scraper = None
         self._init_scraper(kwargs)
         self._cleanup_lock = threading.Lock()
         self._cleanup_complete = False
-        self._cleanup_attempted = False  # Ensure this attribute is defined
-        self.daemon = True
+        self._cleanup_attempted = False
+        self.name = f"Scraper-{threading.current_thread().ident}"  # Give meaningful name
 
     def _init_scraper(self, kwargs):
         keywords = set(kwargs['keywords'].split(','))
-        if kwargs['flagged_keywords'] == '':
-            flagged_keywords = []
-        else:
-            flagged_keywords = set(kwargs['flagged_keywords'].split(','))
+        flagged_keywords = set(kwargs['flagged_keywords'].split(',')) if kwargs['flagged_keywords'] else set()
+        
         if kwargs['website'] == 'eros':
             self.scraper = ErosScraper()
         elif kwargs['website'] == 'escortalligator':
@@ -186,18 +208,18 @@ class ScraperThread(threading.Thread):
             self.scraper = YesbackpageScraper()
         elif kwargs['website'] == 'rubratings':
             self.scraper = RubratingsScraper()
+        
         self.scraper.set_keywords(keywords)
         self.scraper.set_path(kwargs['path'])
         self.scraper.set_flagged_keywords(flagged_keywords)
+        self.scraper.set_search_mode(kwargs['search_mode'])
+        self.scraper.set_city(kwargs['city'])
         if kwargs['inclusive_search']:
             self.scraper.set_join_keywords()
-        if kwargs['search_text'] != '':  # disables search text if blank
-            self.scraper.keywords.add(kwargs['search_text'])
-        self.scraper.set_search_mode(kwargs['search_mode'])
         if kwargs['payment_methods_only']:
             self.scraper.set_only_posts_with_payment_methods()
-        self.scraper.set_city(kwargs['city'])
-        self._stop_event.clear()
+
+        self.scraper._stop_event = self._stop_event  # Add this line
 
     def run(self):
         try:
@@ -209,19 +231,30 @@ class ScraperThread(threading.Thread):
             print(f"Error during scraper execution: {e}")
             socketio.emit('scraper_update', {'status': 'error', 'error': str(e)})
         finally:
+            print("Cleaning up resources in run()...")
             self.cleanup_resources()
             socketio.emit('scraper_update', {'status': 'completed'})
 
     def cleanup_resources(self):
+        print("Running cleanup_resources...")
+        self.centralized_cleanup()
+
+    def centralized_cleanup(self):
         with self._cleanup_lock:
-            if not self._cleanup_complete:
-                try:
-                    if self.scraper and self.scraper.driver:
-                        self.scraper.driver.quit()
-                except Exception as e:
-                    print(f"Error cleaning up resources: {e}")
-                finally:
-                    self._cleanup_complete = True
+            if self._cleanup_complete:
+                print("Cleanup already completed.")
+                return
+            try:
+                if self.scraper and getattr(self.scraper, 'driver', None):
+                    print("Attempting to quit WebDriver in centralized_cleanup...")
+                    self.scraper.driver.quit()
+                    self.scraper.driver = None
+                    print("Driver quit successfully in centralized_cleanup.")
+            except Exception as e:
+                print(f"Error in centralized_cleanup: {e}")
+            finally:
+                self._cleanup_complete = True
+                self._stop_event.set()
 
     def stop_thread(self):
         """Stops the scraper thread gracefully."""
@@ -231,32 +264,22 @@ class ScraperThread(threading.Thread):
             self._cleanup_attempted = True
             if self.scraper and not self.scraper.completed:
                 self.scraper.stop_scraper()
-                if hasattr(self.scraper, 'driver'):
-                    try:
-                        self.scraper.driver.quit()
-                    except:
-                        pass
+            self.centralized_cleanup()
         except Exception as e:
             print(f"Error stopping scraper: {e}")
         finally:
             self._stop_event.set()
 
     def join_with_timeout(self, timeout=5):
-        """
-        Waits for the thread to terminate within a timeout.
-        If the thread doesn't terminate in time, force stops it.
-        """
         self._stop_event.set()
-        start_time = time.time()
-        check_interval = 0.1
-        while self.is_alive() and time.time() - start_time < timeout:
-            time.sleep(check_interval)
-            if not self.is_alive():
-                break
+        start = time.time()
+        while self.is_alive() and time.time() - start < timeout:
+            time.sleep(0.1)
+        if self.is_alive():
+            print(f"Thread {self.ident} failed to join within timeout")
 
     def stopped(self):
         return self._stop_event.is_set()
-
 
 # Defining Scraper Manager Obj for managing scraper and its thread
 scraper_manager = ScraperManager()
@@ -424,10 +447,12 @@ def write_open_ports(ports):
 
 
 def find_open_port():
+    print("Finding open port...")
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.bind(('127.0.0.1', 0))
     port = s.getsockname()[1]
     s.close()
+    print("Found open port:", port)
     return port
 
 
